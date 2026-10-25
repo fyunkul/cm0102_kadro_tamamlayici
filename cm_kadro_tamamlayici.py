@@ -200,7 +200,6 @@ def fill_clubs(D, targets, out_dir, seed=2026, progress=None):
             struct.pack_into('<HHBBBB', ds, O_DOB, day, year, leap, 0, 0, 0)
             struct.pack_into('<h', ds, O_YOB, year)
             struct.pack_into('<i', ds, O_NAT1, nat); struct.pack_into('<i', ds, O_NAT2, -1)
-            ds[32] = 0; ds[33] = 0
             struct.pack_into('<i', ds, O_CLUBJOB, c['id']); ds[O_JOBCLUB] = 11
             struct.pack_into('<i', ds, O_PLAYERID, pid); struct.pack_into('<i', ds, O_PREFID, sid)
             struct.pack_into('<i', ds, O_NONPLAYERID, -1); ds[O_SQUADFOR] = 0
