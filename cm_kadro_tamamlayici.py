@@ -150,10 +150,46 @@ def planned_additions(c, target):
     return max(0, min(target - c['players'], c['free']))
 
 
-def fill_clubs(D, targets, out_dir, seed=2026, progress=None):
+def build_free_agents(D):
+    """Kulübü olmayan gerçek oyuncular (dosya boyutunu değiştirmeden kullanılabilirler)."""
+    in_squad = set()
+    for i in range(D.n_club):
+        in_squad.update(x for x in struct.unpack_from('<50i', D.C(i), C_SQUAD) if x >= 0)
+    out = []
+    for sid in range(D.n_staff):
+        s = D.S(sid)
+        pid = struct.unpack_from('<i', s, O_PLAYERID)[0]
+        if pid < 0 or struct.unpack_from('<i', s, O_CLUBJOB)[0] >= 0 or s[O_JOBCLUB] != 11 or sid in in_squad:
+            continue
+        yob = struct.unpack_from('<h', s, O_YOB)[0]
+        p = D.P(pid)
+        ca = struct.unpack_from('<h', p, P_CA)[0]
+        if ca <= 0 or not (BASE_YEAR - 37 <= yob <= BASE_YEAR - 16) or sum(p[P_ATTR:P_ATTR_END]) < 100:
+            continue
+        out.append([sid, pid, ca, role_of(list(p[P_POS:P_POS + 12])), struct.unpack_from('<i', s, O_NAT1)[0]])
+    return out
+
+
+def take_free_agent(fa, role, nat, ref_ca, rng):
+    for pred in (lambda a: a[4] == nat and a[3] == role, lambda a: a[3] == role and a[4] == nat or a[3] == role,
+                 lambda a: a[4] == nat):
+        cand = [a for a in fa if pred(a)]
+        if cand:
+            cand.sort(key=lambda a: abs(a[2] - ref_ca))
+            a = cand[rng.randrange(min(5, len(cand)))]
+            fa.remove(a)
+            return a
+    return None
+
+
+def fill_clubs(D, targets, out_dir, seed=2026, progress=None, mode='reuse'):
+    """mode: 'reuse' = yalnızca kulübü olmayan mevcut oyuncuları kadroya kat (dosya boyutu değişmez, güvenli);
+    'mixed' = önce onları kullan, yetmezse yeni oluştur; 'create' = hep yeni oluştur."""
     """targets: {kulüp_id: hedef_kadro}. Değişen dosyaları out_dir'e yazar. D bellekte değişir (tekrar yükle)."""
     rng = random.Random(seed)
     pools = build_donors(D)
+    fa = build_free_agents(D) if mode != 'create' else None
+    stats = collections.Counter()
     name_cache, nat_add = {}, collections.Counter()
     new_staff, new_player, new_pref, log = bytearray(), bytearray(), bytearray(), []
     n_staff, n_player = D.n_staff, D.n_player
@@ -180,11 +216,31 @@ def fill_clubs(D, targets, out_dir, seed=2026, progress=None):
         if nat not in name_cache:
             name_cache[nat] = (name_pool(D.first, nat), name_pool(D.second, nat))
         (fids, fw), (sids, sw) = name_cache[nat]
+        slot = 0
         for n in range(need):
             role = max(('GK', 'DEF', 'MID', 'ATT'),
                        key=lambda r: (q[r] - roles[r] - added[r], r == 'GK', r == 'DEF'))
-            added[role] += 1
             donor = pick_donor(pools, role, c['rep'], rng)
+            if fa is not None:
+                ref_ca = struct.unpack_from('<h', D.P(struct.unpack_from('<i', D.S(donor), O_PLAYERID)[0]), P_CA)[0]
+                got = take_free_agent(fa, role, nat, ref_ca, rng)
+                if got is not None:
+                    sid, pid = got[0], got[1]
+                    added[role] += 1
+                    struct.pack_into('<i', D.staff, sid * STAFF_R + O_CLUBJOB, c['id'])
+                    D.staff[sid * STAFF_R + O_JOBCLUB] = 11
+                    num = next((x for x in ((1, 12, 13) if role == 'GK' else range(2, 100)) if x not in used_numbers), 99)
+                    used_numbers.add(num); D.player[pid * PLAYER_R + P_NUM] = num
+                    struct.pack_into('<i', D.club, i * CLUB_R + C_SQUAD + free_slots[slot] * 4, sid)
+                    slot += 1; stats['reused'] += 1
+                    log.append((c['id'], c['name'], sid, -1, -1, role, got[2], 0))
+                    continue
+                if mode == 'reuse':
+                    stats['short'] += 1
+                    continue
+            added[role] += 1
+            stats['created'] += 1
+            donor = donor
             ds = bytearray(D.S(donor)); dp = bytearray(D.P(struct.unpack_from('<i', ds, O_PLAYERID)[0]))
             sid, pid = n_staff, n_player
             n_staff += 1; n_player += 1
@@ -211,7 +267,8 @@ def fill_clubs(D, targets, out_dir, seed=2026, progress=None):
                     dp[k] = max(1, min(20, dp[k] + rng.choice((-1, 1))))
             pref = bytearray(b'\xff' * PREF_R); struct.pack_into('<i', pref, 0, sid)
             new_staff += ds; new_player += dp; new_pref += pref
-            struct.pack_into('<i', D.club, i * CLUB_R + C_SQUAD + free_slots[n] * 4, sid)
+            struct.pack_into('<i', D.club, i * CLUB_R + C_SQUAD + free_slots[slot] * 4, sid)
+            slot += 1
             nat_add[nat] += 1
             log.append((c['id'], c['name'], sid, fi, si, role, struct.unpack_from('<h', dp, P_CA)[0], year))
         filled += 1
@@ -243,7 +300,7 @@ def fill_clubs(D, targets, out_dir, seed=2026, progress=None):
         w = csv.writer(f, delimiter=';')
         w.writerow(['KulupId', 'Kulup', 'StaffNo', 'AdId', 'SoyadId', 'Rol', 'CA', 'DogumYili(Data)'])
         w.writerows(log)
-    return dict(clubs=filled, players=ns)
+    return dict(clubs=filled, players=ns + stats['reused'], reused=stats['reused'], created=stats['created'], short=stats['short'])
 
 
 def backup_files(folder):
@@ -279,8 +336,8 @@ def cmd_fill(a):
             if r and r[ix['Sec(1/0)']].strip() in ('1', 'x', 'X', 'evet'):
                 sel[int(r[ix['KulupId']])] = int(r[ix['HedefKadro']])
     D = Data(a.data)
-    res = fill_clubs(D, sel, a.out, a.seed, progress=None)
-    print('%d kulüp dolduruldu, %d oyuncu eklendi -> %s' % (res['clubs'], res['players'], a.out))
+    res = fill_clubs(D, sel, a.out, a.seed, progress=None, mode=a.mode)
+    print('%d kulüp, %d oyuncu (serbest:%d yeni:%d eksik:%d) -> %s' % (res['clubs'], res['players'], res['reused'], res['created'], res['short'], a.out))
 
 
 # ============================================================================ pencere
@@ -361,7 +418,7 @@ def run_gui():
             ttk.Button(bar, text='Tüm işaretlilere uygula', command=lambda: self.apply_target(all_checked=True)).pack(side='left', padx=4)
 
             out = ttk.LabelFrame(self, text='Çıktı', padding=6); out.pack(fill='x', padx=6, pady=6)
-            self.v_mode = tk.StringVar(value='new')
+            self.v_mode = tk.StringVar(value='new'); self.v_create = tk.BooleanVar(value=False)
             r1 = ttk.Frame(out); r1.pack(fill='x')
             ttk.Radiobutton(r1, text='Yeni klasöre yaz (Data\'ya dokunma):', variable=self.v_mode, value='new').pack(side='left')
             self.v_out = tk.StringVar()
@@ -369,6 +426,7 @@ def run_gui():
             ttk.Button(r1, text='Gözat…', command=self.browse_out).pack(side='left')
             ttk.Radiobutton(out, text='Doğrudan Data klasörüne yaz (önce Data içine otomatik yedek alınır)', variable=self.v_mode, value='inplace').pack(anchor='w')
 
+            ttk.Checkbutton(out, text='Kulübü olmayan oyuncular yetmezse yeni oyuncu da üret (deneysel: dosya boyutu büyür)', variable=self.v_create).pack(anchor='w')
             bt = ttk.Frame(self, padding=(6, 0, 6, 6)); bt.pack(fill='x')
             self.v_info = tk.StringVar(value='Data klasörünü seçip Yükle\'ye bas.')
             ttk.Label(bt, textvariable=self.v_info).pack(side='left')
@@ -530,7 +588,7 @@ def run_gui():
             def work():
                 try:
                     bdir = backup_files(folder) if inplace else None
-                    res = fill_clubs(self.D, tg, out, seed, progress=lambda s, n: self.q.put(('prog', s, n)))
+                    res = fill_clubs(self.D, tg, out, seed, progress=lambda s, n: self.q.put(('prog', s, n)), mode=('mixed' if self.v_create.get() else 'reuse'))
                     self.q.put(('done', res, out, bdir, inplace))
                 except Exception as ex:
                     self.q.put(('error', 'Hata: %s' % ex))
@@ -549,7 +607,9 @@ def run_gui():
                     elif m[0] == 'done':
                         res, out, bdir, inplace = m[1], m[2], m[3], m[4]
                         self.pb.configure(value=100)
-                        txt = '%d kulüp dolduruldu, %d oyuncu eklendi.\n\n' % (res['clubs'], res['players'])
+                        txt = '%d kulüp, %d oyuncu eklendi (serbest oyuncudan: %d, yeni üretilen: %d).\n' % (res['clubs'], res['players'], res['reused'], res['created'])
+                        if res['short']: txt += 'UYARI: %d kadro yeri doldurulamadı (yeterli serbest oyuncu yok).\n' % res['short']
+                        txt += '\n'
                         txt += ('Data klasörüne yazıldı. Eski dosyaların yedeği:\n%s\n' % bdir if inplace
                                 else 'Çıktı klasörü:\n%s\n\nBu klasördeki staff.dat, club.dat, nation.dat ve index.dat dosyalarını Data klasörüne kopyala.\n' % out)
                         txt += '\nEklenen oyuncular yeni oyunda görünür.'
@@ -572,7 +632,7 @@ def main():
     r.add_argument('--target', type=int, default=20); r.add_argument('--csv', default='eksik_kulupler.csv')
     r.add_argument('--nations', default='')
     f = sub.add_parser('fill'); f.add_argument('data'); f.add_argument('--csv', default='eksik_kulupler.csv')
-    f.add_argument('--out', default='Data_yeni'); f.add_argument('--seed', type=int, default=2026)
+    f.add_argument('--out', default='Data_yeni'); f.add_argument('--mode', default='reuse', choices=['reuse', 'mixed', 'create']); f.add_argument('--seed', type=int, default=2026)
     sub.add_parser('gui')
     a = p.parse_args()
     {'report': cmd_report, 'fill': cmd_fill, 'gui': lambda a: run_gui()}[a.cmd](a)
